@@ -14,6 +14,12 @@ import pandas as pd
 from tqdm import tqdm
 import random
 import Bio
+# Paul
+from transformers import XLNetTokenizer, XLNetLMHeadModel
+from MonoCTRL import T5_tools, MonoXLNet, MonobodyData
+import torch.nn as nn
+
+
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 conversion = 'ARNDCQEGHILKMFPSTWYVX-'
@@ -242,7 +248,7 @@ class HydrophobicBias(Potential):
         if self.loss_type == 'simple':
             gravy_score = torch.mean(torch.sum(soft_seq*gravy_matrix,dim=-1), dim=0)
             loss = ((gravy_score - self.target_score)**2)**0.5
-            #print(f'LOSS: {loss}')
+            # print(f'LOSS: {loss}')
             # Take backward step
             loss.backward()
 
@@ -255,7 +261,7 @@ class HydrophobicBias(Potential):
         # Calculate MSE loss on gravy_score
         elif self.loss_type == 'complex':
             loss = torch.mean((torch.sum(soft_seq*gravy_matrix, dim = -1) - self.target_score)**2)
-            #print(f'LOSS: {loss}')
+            print(f'LOSS: {loss}')
             # Take backward step
             loss.backward()
 
@@ -686,6 +692,101 @@ class PSSMbias(Potential):
 
         return self.PSSM*self.potential_scale
 
+    
+    
+class MonobodyClassifier(Potential):
+    """
+
+    """
+
+    def __init__(self, args, features, potential_scale, DEVICE):
+        model_path = '/home/ubuntu/MonoCTRL/XLNet_model_custom_NR4A3_v4_loop_plm/checkpoint-250'
+        self.monoxl_model = MonoXLNet.MonoXLNetLMHeadModel.from_pretrained(model_path)
+        self.monoxl_model = self.monoxl_model.eval().to(DEVICE)
+        self.tokenizer = XLNetTokenizer.from_pretrained('Rostlab/prot_xlnet', do_lower_case=False)
+        
+        labels = ['<non-binder>', '<binder>']
+        self.tokenizer.add_tokens(labels)
+
+        self.potential_scale = potential_scale
+
+    def tag_prediction(self, input, outputs):
+        mask_pos = torch.where(input['input_ids'][0] == self.tokenizer.mask_token_id)[0].item()
+        token_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        probs = {self.tokenizer.decode(i): prob.item() for i, prob in enumerate(token_probs[0, mask_pos])}
+        probs = {k: v for k, v in sorted(probs.items(), key=lambda item: item[1], reverse=True)}
+        return probs['<binder>']
+
+    def get_gradients(self, protein_gen_seq_logits):
+        aa_seq = ''.join([conversion[i] for i in torch.argmax(protein_gen_seq_logits, dim=-1)])
+        seq_for_monoXL = '<mask>' + '<s>' + T5_tools.space_out(aa_seq) + '</s>'
+
+        with torch.no_grad():
+            input = self.tokenizer(seq_for_monoXL, max_length=100, padding='max_length', add_special_tokens=False, return_tensors="pt")
+            outputs = self.monoxl_model(input_ids=input['input_ids'].cuda(), attention_mask=input['attention_mask'].cuda())
+            prob_binder = self.tag_prediction(input, outputs)
+            print(f'Binder probability: {prob_binder}')
+
+        monoXL_logits = outputs.logits
+        
+        # pull out the logits for the AA positions, betwen <s> and </s>
+        pos_start = torch.where(input['input_ids'][0] == self.tokenizer.bos_token_id)[0].item() + 1
+        pos_end = torch.where(input['input_ids'][0] == self.tokenizer.eos_token_id)[0].item()
+        monoXL_logits = monoXL_logits[0, pos_start:pos_end, :]
+
+        # reorder monoXL_logits to match the AA order in seq (logits from Protein Generator)
+        new_monoXL_logits = torch.zeros_like(protein_gen_seq_logits)
+        token_dict = self.tokenizer.get_vocab()
+
+        for i, aa in enumerate(conversion[:-1]):
+            if aa == 'X' or aa == '-':
+                aa_token_id = self.tokenizer.unk_token_id
+            else:
+                aa_token_id = token_dict['▁' + aa]
+            new_monoXL_logits[:, i] = monoXL_logits[:, aa_token_id]
+
+        new_monoXL_logits = new_monoXL_logits.requires_grad_(requires_grad=False).to(DEVICE)
+        protein_gen_seq_logits = protein_gen_seq_logits.clone()#.requires_grad_(requires_grad=True).to(DEVICE)
+
+        # diff = torch.subtract(protein_gen_seq_logits, new_monoXL_logits)
+        # print(diff.shape, diff[1, :])
+        # loss = torch.mean(diff).requires_grad_(requires_grad=True).to(DEVICE) #.requires_grad_(requires_grad=True)
+
+        apply_softmax = True
+        if apply_softmax:
+            protein_gen_seq_logits = torch.softmax(protein_gen_seq_logits, dim=-1).requires_grad_(requires_grad=True).to(DEVICE)
+            new_monoXL_logits = torch.softmax(new_monoXL_logits, dim=-1)
+            print(torch.argmax(protein_gen_seq_logits, dim=-1), '\n', torch.argmax(new_monoXL_logits, dim=-1))
+
+        mse_loss = nn.MSELoss()
+
+        loss = mse_loss(protein_gen_seq_logits, new_monoXL_logits)
+        print(f'LOSS: {loss}')
+
+        loss.backward()            
+
+        self.potential_scale = 100
+
+        self.gradients = protein_gen_seq_logits.grad * self.potential_scale
+        # print(self.gradients.shape, self.gradients[1, :])
+
+        
+
+        return -self.gradients #* self.potential_scale
+
+
+    # soft_seq = torch.softmax(seq,dim=-1).requires_grad_(requires_grad=True).to(DEVICE)
+
+    #     # Calculate simple MSE loss on gravy_score
+    #     if self.loss_type == 'simple':
+    #         gravy_score = torch.mean(torch.sum(soft_seq*gravy_matrix,dim=-1), dim=0)
+    #         loss = ((gravy_score - self.target_score)**2)**0.5
+    #         # print(f'LOSS: {loss}')
+    #         # Take backward step
+    #         loss.backward()
+
+    #         # Get gradients from soft_seq
+    #         self.gradients = soft_seq.grad
 
 ### ADD NEW POTENTIALS INTO LIST DOWN BELOW ###
-POTENTIALS = {'aa_bias':AACompositionalBias, 'charge':ChargeBias, 'hydrophobic':HydrophobicBias, 'PSSM':PSSMbias}
+POTENTIALS = {'aa_bias':AACompositionalBias, 'charge':ChargeBias, 'hydrophobic':HydrophobicBias, 'PSSM':PSSMbias, 'monobody': MonobodyClassifier}

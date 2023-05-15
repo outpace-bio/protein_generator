@@ -207,7 +207,7 @@ def main():
     # chose sampler
     chosen_sampler = sampler_map[args.sampler]
     print(f'using sampler: {args.sampler}')
-
+    print(chosen_sampler)
     # initiate sampler class
     S = chosen_sampler(vars(args))    
     
@@ -219,6 +219,7 @@ def main():
         # wrap argdicts in a list if not inputed as one
         if isinstance(argdicts,dict):
             argdicts = [argdicts]
+
         S.set_args(argdicts[0])
     else:
         # no json input, spoof list of argument dicts
@@ -237,6 +238,7 @@ def main():
             print(f'\nAdding argument dict {i_argdict} from input JSON ({len(argdicts)} total):')
             
             ### HERE IS WHERE ARGUMENTS SHOULD GET SET 
+
             S.set_args(argdict)
             S.diffuser_init()
 
@@ -248,7 +250,7 @@ def main():
                 print(f'CAUTIOUS MODE: Skipping design because output file '\
                       f'{out_prefix + ".pdb"} already exists.')
                 continue
-            
+            print(S.args)
             S.generate_sample()
 
 if __name__ == '__main__':
